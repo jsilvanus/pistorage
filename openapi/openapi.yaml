@@ -1,0 +1,334 @@
+openapi: 3.1.0
+info:
+  title: pistorage API
+  version: 0.1.0
+  description: >
+    Durable file storage for the Pi ecosystem: an S3-compatible backend behind a read-through
+    disk cache with TTL and LRU eviction. Object bytes are sent raw (application/octet-stream
+    or the object's own content type); the JSON routes are described here. The CLI and the
+    src/client.ts module wrap the object routes directly. Keys may contain "/"; in URLs each
+    segment is percent-encoded and the slashes are kept.
+servers:
+  - url: http://127.0.0.1:3700
+tags:
+  - name: System
+  - name: Objects
+security:
+  - bearerAuth: []
+  - apiKeyHeader: []
+paths:
+  /health:
+    get:
+      operationId: getHealth
+      tags: [System]
+      security: []
+      responses:
+        "200":
+          description: The process is running.
+  /api/v1/status:
+    get:
+      operationId: getStatus
+      tags: [System]
+      responses:
+        "200":
+          description: Backend, cache and retention state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Status"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /api/v1/cache/prune:
+    post:
+      operationId: pruneCache
+      tags: [System]
+      summary: Drop dead cache entries and enforce the size cap now.
+      responses:
+        "200":
+          description: What was removed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PruneResult"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /api/v1/retention/sweep:
+    post:
+      operationId: sweepRetention
+      tags: [System]
+      summary: Delete backend objects whose retention deadline has passed. Answers 409 unless PISTORAGE_RETENTION_SWEEP=1.
+      responses:
+        "200":
+          description: Sweep report.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RetentionReport"
+        "409":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /api/v1/objects:
+    get:
+      operationId: listObjects
+      tags: [Objects]
+      parameters:
+        - name: prefix
+          in: query
+          schema:
+            type: string
+            maxLength: 512
+            default: ""
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 1000
+      responses:
+        "200":
+          description: Objects under the prefix, in key order.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ObjectList"
+        "503":
+          $ref: "#/components/responses/Error"
+  /api/v1/objects/{key}:
+    parameters:
+      - $ref: "#/components/parameters/Key"
+    put:
+      operationId: putObject
+      tags: [Objects]
+      summary: Store an object. Content-Length is required; the backend is written before the cache.
+      parameters:
+        - name: x-pistorage-expires-at
+          in: header
+          required: false
+          description: ISO 8601 retention deadline (must be in the future). The object reads as missing after it.
+          schema:
+            type: string
+            format: date-time
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "201":
+          description: Stored.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ObjectInfo"
+        "400":
+          $ref: "#/components/responses/Error"
+        "411":
+          $ref: "#/components/responses/Error"
+        "413":
+          $ref: "#/components/responses/Error"
+        "503":
+          $ref: "#/components/responses/Error"
+    get:
+      operationId: getObject
+      tags: [Objects]
+      summary: Read an object. Supports a single byte range (206), 416 when unsatisfiable.
+      parameters:
+        - name: Range
+          in: header
+          required: false
+          schema:
+            type: string
+            example: bytes=0-99
+      responses:
+        "200":
+          description: The whole object.
+          headers:
+            x-pistorage-stale:
+              description: Set to 1 when the backend was unreachable and a copy past its TTL was served.
+              schema:
+                type: string
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "206":
+          description: The requested range.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "404":
+          $ref: "#/components/responses/Error"
+        "416":
+          $ref: "#/components/responses/Error"
+        "503":
+          $ref: "#/components/responses/Error"
+    head:
+      operationId: headObject
+      tags: [Objects]
+      summary: Object headers only (Content-Length, Content-Type, ETag, Last-Modified, x-pistorage-expires-at).
+      responses:
+        "200":
+          description: Object exists.
+        "404":
+          description: No such object.
+        "503":
+          description: Backend unreachable and no cached copy.
+    delete:
+      operationId: deleteObject
+      tags: [Objects]
+      summary: Delete an object from the backend and the cache. Idempotent.
+      responses:
+        "204":
+          description: Deleted (or already absent).
+        "503":
+          $ref: "#/components/responses/Error"
+components:
+  parameters:
+    Key:
+      name: key
+      in: path
+      required: true
+      description: Object key, at most 512 characters. No leading "/", no "..", no empty or "." segments.
+      schema:
+        type: string
+        maxLength: 512
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+    apiKeyHeader:
+      type: apiKey
+      in: header
+      name: x-api-key
+  responses:
+    Unauthorized:
+      description: PISTORAGE_API_KEY is set and the request did not present it.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Error:
+      description: Error.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+            message:
+              type: string
+    ObjectInfo:
+      type: object
+      required: [key, size, contentType, etag, lastModified]
+      properties:
+        key:
+          type: string
+        size:
+          type: integer
+        contentType:
+          type: string
+        etag:
+          type: string
+        lastModified:
+          type: string
+          format: date-time
+        expiresAt:
+          type: string
+          format: date-time
+    ObjectList:
+      type: object
+      required: [items, truncated]
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            required: [key, size, etag, lastModified]
+            properties:
+              key:
+                type: string
+              size:
+                type: integer
+              etag:
+                type: string
+              lastModified:
+                type: string
+        truncated:
+          type: boolean
+    PruneResult:
+      type: object
+      required: [removed, freedBytes, backendReachable]
+      properties:
+        removed:
+          type: integer
+        freedBytes:
+          type: integer
+        backendReachable:
+          type: boolean
+    RetentionReport:
+      type: object
+      required: [at, checked, deleted]
+      properties:
+        at:
+          type: string
+          format: date-time
+        checked:
+          type: integer
+        deleted:
+          type: integer
+    Status:
+      type: object
+      required: [backend, cache, staleServed, retentionSweepEnabled, maxUploadBytes]
+      properties:
+        backend:
+          type: object
+          required: [kind, location, reachable]
+          properties:
+            kind:
+              type: string
+              enum: [s3, local]
+            location:
+              type: string
+            reachable:
+              type: boolean
+        cache:
+          type: object
+          required: [dir, bytes, count, maxBytes, ttlSeconds]
+          properties:
+            dir:
+              type: string
+            bytes:
+              type: integer
+            count:
+              type: integer
+            maxBytes:
+              type: integer
+            ttlSeconds:
+              type: integer
+        staleServed:
+          type: integer
+          description: Responses served from cache past their TTL because the backend was unreachable, since start.
+        lastRetentionSweep:
+          oneOf:
+            - $ref: "#/components/schemas/RetentionReport"
+            - type: "null"
+        retentionSweepEnabled:
+          type: boolean
+        maxUploadBytes:
+          type: integer

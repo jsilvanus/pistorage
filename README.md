@@ -78,6 +78,19 @@ PISTORAGE_S3_FORCE_PATH_STYLE=1
 
 The client sends no streaming checksums (`requestChecksumCalculation: WHEN_REQUIRED`), because several S3-compatible stores reject them. Uploads need a `Content-Length`.
 
+## Moving to another backend (setup-time script)
+
+`pnpm migrate` (or `pistorage-migrate`) copies every object from one backend to another: local disk to S3, or one S3 service to another. It is a script for setup time, not a service. Content type, retention expiry and `useAt` travel with each object. The source is only read, never changed or emptied. An object that the destination already has with the same size is skipped, so an interrupted run can simply be started again; each copy is checked by reading its size back. Failures are listed and the exit code is 1.
+
+```
+MIGRATE_FROM_LOCAL_DIR=/home/pi/apps/pistorage-data/store \
+MIGRATE_TO_S3_ENDPOINT=http://192.168.1.50:7070 MIGRATE_TO_S3_BUCKET=pistorage \
+MIGRATE_TO_S3_ACCESS_KEY=... MIGRATE_TO_S3_SECRET_KEY=... \
+pnpm migrate --dry-run
+```
+
+Each side (`MIGRATE_FROM_` and `MIGRATE_TO_`) takes either `LOCAL_DIR`, or `S3_ENDPOINT` + `S3_BUCKET` (+ `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_REGION`, `S3_FORCE_PATH_STYLE` as in the table above), and `KEY_PREFIX` (default `pi/`, `none` for no prefix; use the same prefix on both sides unless you mean to change it). `--dry-run` lists what would be copied; `--overwrite` copies even when the size matches. Stop uploads while it runs, then change the `PISTORAGE_*` settings to the new backend and restart. The cache and spool on the Pi are not moved. Objects written to the old backend after the copy are not carried over: run it once more just before the switch. Not run against a real S3 service.
+
 ## HTTP API (`/api/v1`)
 
 | Method and path | What it does |
@@ -174,6 +187,7 @@ Then `systemctl --user daemon-reload && systemctl --user enable --now pistorage`
 
 ## Layout
 
+- `src/migrate.ts`, `src/migrate-main.ts` - the backend-to-backend copy script
 - `src/backend.ts`, `src/backends/` - the backend interface, S3 and local disk
 - `src/cache.ts` - the disk cache (index, TTL, LRU, flush)
 - `src/storage.ts` - read-through, write-through and stale logic, retention

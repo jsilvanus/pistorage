@@ -82,6 +82,16 @@ export class LocalBackend implements StorageBackend {
     await rm(`${stem}.bin`, { force: true });
   }
 
+  async setUseAt(key: string, useAt: string[]): Promise<ObjectInfo | null> {
+    const stem = join(this.objectsDir, objectStem(key));
+    const info = await this.readMeta(stem);
+    if (!info) return null;
+    const { useAt: _old, ...rest } = info;
+    const updated: ObjectInfo = useAt.length ? { ...rest, useAt } : rest;
+    await this.writeMeta(stem, updated);
+    return updated;
+  }
+
   async list(prefix: string, limit?: number): Promise<ListResult> {
     let names: string[];
     try {

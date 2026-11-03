@@ -1,5 +1,6 @@
 import type { Readable } from "node:stream";
 import {
+  CopyObjectCommand,
   DeleteObjectCommand,
   GetObjectCommand,
   HeadBucketCommand,
@@ -146,6 +147,36 @@ export class S3Backend implements StorageBackend {
 
   async delete(key: string): Promise<void> {
     await this.run("delete", new DeleteObjectCommand({ Bucket: this.bucket, Key: key }));
+  }
+
+  /** Copies the object onto itself with replaced metadata: the bytes stay inside the store. */
+  async setUseAt(key: string, useAt: string[]): Promise<ObjectInfo | null> {
+    const current = await this.head(key);
+    if (!current) return null;
+    const metadata: Record<string, string> = {
+      ...(current.expiresAt ? { [EXPIRES_METADATA]: current.expiresAt } : {}),
+      ...(useAt.length ? { [USE_AT_METADATA]: useAt.join(", ") } : {})
+    };
+    const out = await this.run<{ CopyObjectResult?: { ETag?: string; LastModified?: Date } }>(
+      "set use-at",
+      new CopyObjectCommand({
+        Bucket: this.bucket,
+        Key: key,
+        CopySource: `${this.bucket}/${key.split("/").map(encodeURIComponent).join("/")}`,
+        MetadataDirective: "REPLACE",
+        ContentType: current.contentType,
+        Metadata: metadata
+      }),
+      true
+    );
+    if (!out) return null;
+    const { useAt: _old, ...rest } = current;
+    return {
+      ...rest,
+      etag: (out.CopyObjectResult?.ETag ?? current.etag).replace(/"/g, ""),
+      lastModified: out.CopyObjectResult?.LastModified?.toISOString() ?? current.lastModified,
+      ...(useAt.length ? { useAt } : {})
+    };
   }
 
   async list(prefix: string, limit?: number): Promise<ListResult> {

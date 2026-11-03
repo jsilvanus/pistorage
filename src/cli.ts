@@ -23,6 +23,7 @@ const USAGE = `Usage: pistorage <command>
   pistorage get <key> <file> [--range bytes=0-99]
   pistorage head <key>
   pistorage rm <key>
+  pistorage use-at <key> <dates|none>
   pistorage ls [prefix] [--limit n]
   pistorage cache prune
   pistorage retention sweep
@@ -118,6 +119,11 @@ export async function runCli(args: string[], io: CliIo): Promise<number> {
         await client.delete(need(values, 0, "key"));
         io.out("deleted");
         return 0;
+      case "use-at": {
+        const value = need(values, 1, "dates (or none)");
+        print(io, await client.setUseAt(need(values, 0, "key"), value === "none" ? null : value));
+        return 0;
+      }
       case "ls": {
         const limit = flag(rest, "--limit");
         print(io, await ObjectsService.listObjects(values[0] ?? "", limit === undefined ? 1000 : Number(limit)));

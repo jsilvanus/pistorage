@@ -334,6 +334,29 @@ export class PiStorage {
     return { info, stale: false };
   }
 
+  /**
+   * Changes when an existing object is meant to be used, without uploading it again. An object
+   * that still waits in the spool is changed there; otherwise the backend is asked (an S3 metadata
+   * copy, so the bytes do not travel) and a cached copy is updated to match. Returns null when
+   * there is no such object. An empty list clears the date.
+   */
+  async setUseAt(key: string, useAt: string[]): Promise<PutResult | null> {
+    const waiting = this.spool?.get(key);
+    if (waiting) {
+      await this.spool!.updateInfo(key, { useAt });
+      const info = this.spool!.get(key)!;
+      return { info: infoOf(info), pending: true };
+    }
+    const info = await this.call(() => this.backend.setUseAt(key, useAt));
+    if (!info) {
+      await this.cache.remove(key);
+      return null;
+    }
+    await this.cache.updateInfo(key, { useAt, etag: info.etag, lastModified: info.lastModified });
+    this.useAtIndex.set(key, { etag: info.etag, useAt });
+    return { info, pending: false };
+  }
+
   async delete(key: string): Promise<void> {
     await this.spool?.remove(key);
     await this.call(() => this.backend.delete(key));

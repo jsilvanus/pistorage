@@ -50,6 +50,11 @@ export class FakeBackend implements StorageBackend {
     return this.inner.delete(key);
   }
 
+  setUseAt(key: string, useAt: string[]): Promise<ObjectInfo | null> {
+    this.gate("setUseAt");
+    return this.inner.setUseAt(key, useAt);
+  }
+
   list(prefix: string, limit?: number): Promise<ListResult> {
     this.gate("list");
     return this.inner.list(prefix, limit);

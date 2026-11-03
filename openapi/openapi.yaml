@@ -52,6 +52,105 @@ paths:
                 $ref: "#/components/schemas/PruneResult"
         "401":
           $ref: "#/components/responses/Unauthorized"
+  /api/v1/spool/flush:
+    post:
+      operationId: flushSpool
+      tags: [System]
+      summary: Upload the writes that waited in the local spool while the backend was down.
+      responses:
+        "200":
+          description: How many went through and how many still wait.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [uploaded, waiting]
+                properties:
+                  uploaded: { type: integer }
+                  waiting: { type: integer }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /api/v1/signed-urls:
+    post:
+      operationId: createSignedUrl
+      tags: [Objects]
+      summary: >-
+        Make a link for one key and one method (GET or PUT) that works without the API key until it expires.
+        Answers 409 when no signing secret is configured.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [key]
+              properties:
+                key: { type: string }
+                method: { type: string, enum: [GET, PUT], default: GET }
+                expiresInSeconds: { type: integer, minimum: 1, maximum: 604800, default: 3600 }
+      responses:
+        "201":
+          description: The link. `url` is present when PISTORAGE_PUBLIC_URL is set.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [method, path, expiresAt]
+                properties:
+                  method: { type: string, enum: [GET, PUT] }
+                  path: { type: string }
+                  url: { type: string }
+                  expiresAt: { type: string, format: date-time }
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Error"
+  /signed/{key}:
+    parameters:
+      - $ref: "#/components/parameters/Key"
+      - name: expires
+        in: query
+        required: true
+        schema: { type: integer }
+      - name: sig
+        in: query
+        required: true
+        schema: { type: string }
+    get:
+      operationId: getSignedObject
+      tags: [Objects]
+      summary: Read an object through a signed link (also HEAD). Same answers as getObject; 403 for a wrong or expired link.
+      security: []
+      responses:
+        "200":
+          description: The object bytes.
+        "206":
+          description: A byte range.
+        "403":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+    put:
+      operationId: putSignedObject
+      tags: [Objects]
+      summary: Store an object through a signed PUT link. Same rules as putObject; 403 for a wrong or expired link.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "201":
+          description: Stored.
+        "202":
+          description: Kept in the local spool while the backend is down.
+        "403":
+          $ref: "#/components/responses/Error"
   /api/v1/retention/sweep:
     post:
       operationId: sweepRetention
@@ -120,6 +219,14 @@ paths:
       responses:
         "201":
           description: Stored.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ObjectInfo"
+        "202":
+          description: >-
+            The backend is down, so the object was kept in the local spool and is served from there.
+            It is uploaded when the backend answers again (header x-pistorage-pending, `pending: true`).
           content:
             application/json:
               schema:
@@ -294,7 +401,7 @@ components:
           type: integer
     Status:
       type: object
-      required: [backend, cache, staleServed, retentionSweepEnabled, maxUploadBytes]
+      required: [backend, cache, spool, staleServed, retentionSweepEnabled, maxUploadBytes]
       properties:
         backend:
           type: object
@@ -321,6 +428,18 @@ components:
               type: integer
             ttlSeconds:
               type: integer
+        spool:
+          type: object
+          required: [enabled, waiting, bytes, maxBytes, oldest]
+          properties:
+            enabled: { type: boolean }
+            waiting: { type: integer, description: Writes kept locally that are not in the backend yet. }
+            bytes: { type: integer }
+            maxBytes: { type: integer }
+            oldest:
+              oneOf:
+                - { type: string, format: date-time }
+                - { type: "null" }
         staleServed:
           type: integer
           description: Responses served from cache past their TTL because the backend was unreachable, since start.

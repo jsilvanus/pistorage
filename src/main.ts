@@ -1,5 +1,6 @@
 import { loadConfig } from "./config.js";
 import { createBackend } from "./backends/index.js";
+import { PrefixedBackend } from "./backends/prefixed.js";
 import { DiskCache } from "./cache.js";
 import { PiStorage } from "./storage.js";
 import { buildServer } from "./server.js";
@@ -10,19 +11,31 @@ import { buildServer } from "./server.js";
  */
 async function main(): Promise<void> {
   const config = loadConfig();
-  const backend = createBackend(config.backend);
+  const rawBackend = createBackend(config.backend);
+  const backend = config.keyPrefix ? new PrefixedBackend(rawBackend, config.keyPrefix) : rawBackend;
   const cache = await DiskCache.open({
     dir: config.cache.dir,
     ttlMs: config.cache.ttlSeconds * 1000,
     maxBytes: config.cache.maxBytes
   });
+  const spool = config.spool
+    ? await DiskCache.open({ dir: config.spool.dir, ttlMs: Number.MAX_SAFE_INTEGER, maxBytes: Number.MAX_SAFE_INTEGER })
+    : undefined;
   const storage = new PiStorage({
     backend,
     cache,
+    spool,
+    spoolMaxBytes: config.spool?.maxBytes,
     maxUploadBytes: config.maxUploadBytes,
     retentionSweepEnabled: config.retention.sweepEnabled
   });
-  const app = buildServer({ storage, apiKey: config.apiKey, logger: true });
+  const app = buildServer({
+    storage,
+    apiKey: config.apiKey,
+    signingSecret: config.signingSecret,
+    publicUrl: config.publicUrl,
+    logger: true
+  });
 
   const log = (message: string, error: unknown) => app.log.error({ err: error }, message);
   const timers = [
@@ -33,6 +46,16 @@ async function main(): Promise<void> {
         .catch((error: unknown) => log("cache sweep failed", error));
     }, config.cache.sweepSeconds * 1000)
   ];
+  if (config.spool) {
+    timers.push(
+      setInterval(() => {
+        storage
+          .flushSpool()
+          .then(() => spool?.flush())
+          .catch((error: unknown) => log("spool flush failed", error));
+      }, config.spool.flushSeconds * 1000)
+    );
+  }
   if (config.retention.sweepEnabled) {
     timers.push(
       setInterval(() => {

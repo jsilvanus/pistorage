@@ -76,7 +76,14 @@ export const DAY_MS = 24 * 3600 * 1000;
 
 /** A storage stack on a temporary directory with a controllable clock. */
 export async function makeHarness(
-  options: { ttlMs?: number; maxBytes?: number; maxUploadBytes?: number; retentionSweepEnabled?: boolean } = {}
+  options: {
+    ttlMs?: number;
+    maxBytes?: number;
+    maxUploadBytes?: number;
+    retentionSweepEnabled?: boolean;
+    spool?: boolean;
+    spoolMaxBytes?: number;
+  } = {}
 ): Promise<Harness> {
   const dir = await mkdtemp(join(tmpdir(), "pistorage-test-"));
   const clock = { now: T0 };
@@ -88,9 +95,14 @@ export async function makeHarness(
     maxBytes: options.maxBytes ?? 1024 * 1024,
     now
   });
+  const spool = options.spool
+    ? await DiskCache.open({ dir: join(dir, "spool"), ttlMs: Number.MAX_SAFE_INTEGER, maxBytes: Number.MAX_SAFE_INTEGER, now })
+    : undefined;
   const storage = new PiStorage({
     backend,
     cache,
+    spool,
+    spoolMaxBytes: options.spoolMaxBytes,
     maxUploadBytes: options.maxUploadBytes ?? 1024 * 1024,
     retentionSweepEnabled: options.retentionSweepEnabled ?? false,
     now

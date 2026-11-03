@@ -26,6 +26,8 @@ const USAGE = `Usage: pistorage <command>
   pistorage ls [prefix] [--limit n]
   pistorage cache prune
   pistorage retention sweep
+  pistorage spool flush
+  pistorage sign <key> [--method GET|PUT] [--expires-in seconds]
 
 Environment: PISTORAGE_URL (default http://127.0.0.1:3700), PISTORAGE_API_KEY.
 `;
@@ -127,6 +129,17 @@ export async function runCli(args: string[], io: CliIo): Promise<number> {
         if (values[0] !== "sweep") throw new Error("expected: retention sweep");
         print(io, await SystemService.sweepRetention());
         return 0;
+      case "spool":
+        if (values[0] !== "flush") throw new Error("expected: spool flush");
+        print(io, await client.flushSpool());
+        return 0;
+      case "sign": {
+        const method = flag(rest, "--method") ?? "GET";
+        if (method !== "GET" && method !== "PUT") throw new Error("--method must be GET or PUT");
+        const seconds = flag(rest, "--expires-in");
+        print(io, await client.signUrl(need(values, 0, "key"), { method, ...(seconds === undefined ? {} : { expiresInSeconds: Number(seconds) }) }));
+        return 0;
+      }
       default:
         io.err(`unknown command: ${command}\n${USAGE}`);
         return 1;

@@ -76,7 +76,8 @@ export class PiStorageClient {
   }
 
   /** Uploads an object. Strings, byte arrays and Blobs are sent with a known Content-Length. */
-  async put(key: string, body: string | Uint8Array | Blob, options: PutOptions = {}): Promise<ObjectInfo> {
+  /** Resolves with `pending: true` when the backend was down and the object is waiting in pistorage's local spool. */
+  async put(key: string, body: string | Uint8Array | Blob, options: PutOptions = {}): Promise<ObjectInfo & { pending?: boolean }> {
     const headers: Record<string, string> = { "content-type": options.contentType ?? "application/octet-stream" };
     if (options.expiresAt !== undefined) {
       headers["x-pistorage-expires-at"] = typeof options.expiresAt === "string" ? options.expiresAt : options.expiresAt.toISOString();
@@ -87,7 +88,7 @@ export class PiStorageClient {
       body: body as BodyInit
     });
     await this.ensureOk(response);
-    return (await response.json()) as ObjectInfo;
+    return (await response.json()) as ObjectInfo & { pending?: boolean };
   }
 
   /** Downloads an object. Returns the raw Response so that large bodies can be streamed. */
@@ -132,6 +133,29 @@ export class PiStorageClient {
     });
     await this.ensureOk(response);
     return (await response.json()) as ListResult;
+  }
+
+  /**
+   * A link for one key and method that works without the API key until it expires. `url` is set
+   * when the server knows its public address (PISTORAGE_PUBLIC_URL); otherwise join `path` to the base URL.
+   */
+  async signUrl(
+    key: string,
+    options: { method?: "GET" | "PUT"; expiresInSeconds?: number } = {}
+  ): Promise<{ method: "GET" | "PUT"; path: string; url?: string; expiresAt: string }> {
+    const response = await this.fetchFn(`${this.base}/signed-urls`, {
+      method: "POST",
+      headers: this.authHeaders({ "content-type": "application/json" }),
+      body: JSON.stringify({ key, ...options }),
+      signal: this.signal()
+    });
+    await this.ensureOk(response);
+    return (await response.json()) as { method: "GET" | "PUT"; path: string; url?: string; expiresAt: string };
+  }
+
+  /** Uploads the writes that waited in the local spool. */
+  async flushSpool(): Promise<{ uploaded: number; waiting: number }> {
+    return (await this.json("POST", "/spool/flush")) as { uploaded: number; waiting: number };
   }
 
   async status(): Promise<unknown> {

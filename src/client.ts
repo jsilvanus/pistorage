@@ -163,6 +163,21 @@ export class PiStorageClient {
     return (await response.json()) as { method: "GET" | "PUT"; path: string; url?: string; expiresAt: string };
   }
 
+  /**
+   * Changes when an existing object is meant to be used (see use-at.ts) without uploading it again.
+   * Pass null or an empty list to clear it. Throws on 404 when the object does not exist.
+   */
+  async setUseAt(key: string, useAt: string | readonly string[] | null): Promise<ObjectInfo> {
+    const response = await this.fetchFn(`${this.base}/use-at`, {
+      method: "POST",
+      headers: this.authHeaders({ "content-type": "application/json" }),
+      body: JSON.stringify({ key, useAt }),
+      signal: this.signal()
+    });
+    await this.ensureOk(response);
+    return (await response.json()) as ObjectInfo;
+  }
+
   /** Uploads the writes that waited in the local spool. */
   async flushSpool(): Promise<{ uploaded: number; waiting: number }> {
     return (await this.json("POST", "/spool/flush")) as { uploaded: number; waiting: number };

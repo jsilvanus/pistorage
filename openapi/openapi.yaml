@@ -151,6 +151,44 @@ paths:
           description: Kept in the local spool while the backend is down.
         "403":
           $ref: "#/components/responses/Error"
+  /api/v1/use-at:
+    post:
+      operationId: setUseAt
+      tags: [Objects]
+      summary: Change when an existing object is meant to be used, without uploading it again. On S3 this is a metadata copy inside the bucket.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [key, useAt]
+              properties:
+                key:
+                  type: string
+                useAt:
+                  description: A useAt string (entries separated by commas), a list of entries, or null to clear it.
+                  nullable: true
+                  oneOf:
+                    - type: string
+                    - type: array
+                      items:
+                        type: string
+      responses:
+        "200":
+          description: The object with its new useAt. `pending` is true while the object still waits in the local spool.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ObjectInfo"
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/Error"
+        "503":
+          $ref: "#/components/responses/Error"
   /api/v1/prefetch/sweep:
     post:
       operationId: sweepPrefetch

@@ -47,6 +47,10 @@ export class PrefixedBackend implements StorageBackend {
   delete(key: string): Promise<void> {
     return this.inner.delete(this.to(key));
   }
+  async setUseAt(key: string, useAt: string[]): Promise<ObjectInfo | null> {
+    const info = await this.inner.setUseAt(this.to(key), useAt);
+    return info ? this.strip(info) : null;
+  }
   async list(prefix: string, limit?: number): Promise<ListResult> {
     const listing = await this.inner.list(this.to(prefix), limit);
     return { ...listing, items: listing.items.map((item) => this.strip(item)) };

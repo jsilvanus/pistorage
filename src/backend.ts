@@ -58,6 +58,11 @@ export interface StorageBackend {
   get(key: string, range?: ByteRange): Promise<GetResult | null>;
   head(key: string): Promise<ObjectInfo | null>;
   delete(key: string): Promise<void>;
+  /**
+   * Replaces the `useAt` of an existing object without sending its bytes again (an empty list
+   * clears it). Everything else about the object stays. Returns null when there is no such object.
+   */
+  setUseAt(key: string, useAt: string[]): Promise<ObjectInfo | null>;
   list(prefix: string, limit?: number): Promise<ListResult>;
   /** True when the store answers right now. Never throws. */
   ping(): Promise<boolean>;

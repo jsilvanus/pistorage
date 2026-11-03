@@ -77,3 +77,77 @@ describe("useAt in storage", () => {
     opened?.body.destroy();
   });
 });
+
+describe("changing useAt of an existing object", () => {
+  const harnesses: Harness[] = [];
+  afterEach(async () => {
+    await Promise.all(harnesses.splice(0).map((h) => h.cleanup()));
+  });
+  const make = async (now: string, options: Parameters<typeof makeHarness>[0] = {}) => {
+    const h = await makeHarness(options);
+    h.clock.now = Date.parse(now);
+    harnesses.push(h);
+    return h;
+  };
+  const put = (h: Harness, key: string, useAt?: string[], extra: { expiresAt?: string } = {}) =>
+    h.storage.put(key, { size: 5, contentType: "text/plain", body: streamOf("hello"), ...(useAt ? { useAt } : {}), ...extra });
+
+  it("changes and clears the date in the backend and the cached copy without sending the bytes again", async () => {
+    const h = await make("2026-11-06T12:00:00Z");
+    await put(h, "a.txt", ["2026-12-24"], { expiresAt: "2027-01-01T00:00:00.000Z" });
+    const puts = h.backend.calls.filter((c) => c === "put").length;
+
+    const changed = await h.storage.setUseAt("a.txt", ["2026-11-08"]);
+    expect(changed?.info.useAt).toEqual(["2026-11-08"]);
+    expect(h.backend.calls.filter((c) => c === "put").length).toBe(puts);
+    expect(await h.backend.head("a.txt")).toMatchObject({ useAt: ["2026-11-08"], contentType: "text/plain", expiresAt: "2027-01-01T00:00:00.000Z" });
+    expect(h.cache.get("a.txt")?.useAt).toEqual(["2026-11-08"]);
+    // the new date makes it due now, so the cache keeps it
+    expect(h.cache.isPinned(h.cache.get("a.txt")!, h.clock.now)).toBe(true);
+
+    const cleared = await h.storage.setUseAt("a.txt", []);
+    expect(cleared?.info.useAt).toBeUndefined();
+    expect((await h.backend.head("a.txt"))?.useAt).toBeUndefined();
+    expect(h.cache.get("a.txt")?.useAt).toBeUndefined();
+  });
+
+  it("is noticed by the next prefetch sweep even though the object itself did not change", async () => {
+    const h = await make("2026-11-06T12:00:00Z");
+    await put(h, "a.txt", ["2026-12-24"]);
+    await h.cache.remove("a.txt");
+    expect((await h.storage.prefetchDue()).fetched).toBe(0); // not due yet, and now remembered
+    await h.storage.setUseAt("a.txt", ["2026-11-08"]);
+    expect((await h.storage.prefetchDue()).fetched).toBe(1);
+  });
+
+  it("changes an object that still waits in the spool, and answers null for a missing one", async () => {
+    const h = await make("2026-11-06T12:00:00Z", { spool: true });
+    h.backend.offline = true;
+    const queued = await put(h, "w.txt", ["2026-12-24"]);
+    expect(queued.pending).toBe(true);
+    const changed = await h.storage.setUseAt("w.txt", ["2026-11-08"]);
+    expect(changed).toMatchObject({ pending: true, info: { useAt: ["2026-11-08"] } });
+    h.backend.offline = false;
+    await h.storage.flushSpool();
+    expect((await h.backend.head("w.txt"))?.useAt).toEqual(["2026-11-08"]);
+    expect(await h.storage.setUseAt("nope.txt", ["2026-11-08"])).toBeNull();
+  });
+
+  it("is available over HTTP: a date, a list, null to clear, 400 for a bad value, 404 for a missing object", async () => {
+    const h = await make("2026-11-06T12:00:00Z");
+    await put(h, "a.txt");
+    const app = appFor(h.storage);
+    const call = (payload: unknown) => app.inject({ method: "POST", url: "/api/v1/use-at", payload: payload as object });
+    const one = await call({ key: "a.txt", useAt: "2026-11-08, 2026-11-15" });
+    expect(one.statusCode).toBe(200);
+    expect(one.json().useAt).toEqual(["2026-11-08", "2026-11-15"]);
+    expect((await call({ key: "a.txt", useAt: ["2026-11-20/2026-11-21"] })).json().useAt).toEqual(["2026-11-20/2026-11-21"]);
+    expect((await call({ key: "a.txt", useAt: null })).json().useAt).toBeUndefined();
+    const bad = await call({ key: "a.txt", useAt: "next sunday" });
+    expect(bad.statusCode).toBe(400);
+    expect(bad.json().error.code).toBe("INVALID_USE_AT");
+    expect((await call({ key: "a.txt", useAt: 5 })).statusCode).toBe(400);
+    expect((await call({ key: "missing.txt", useAt: "2026-11-08" })).statusCode).toBe(404);
+    await app.close();
+  });
+});

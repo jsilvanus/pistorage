@@ -274,6 +274,26 @@ export function buildServer(options: ServerOptions): FastifyInstance {
     });
   });
 
+  app.post<{ Body: { key?: unknown; useAt?: unknown } }>("/api/v1/use-at", async (request, reply) => {
+    const body = request.body ?? {};
+    if (typeof body.key !== "string") throw new StorageError(400, "INVALID_BODY", "key is required");
+    const key = assertKey(body.key);
+    const value = body.useAt;
+    if (value !== null && typeof value !== "string" && !(Array.isArray(value) && value.every((v) => typeof v === "string"))) {
+      throw new StorageError(400, "INVALID_BODY", "useAt must be a string, a list of strings, or null to clear it");
+    }
+    let entries: string[];
+    try {
+      entries = value === null ? [] : parseUseAt(value as string | string[], storage.timezone);
+    } catch (error) {
+      if (error instanceof UseAtError) throw new StorageError(400, "INVALID_USE_AT", error.message);
+      throw error;
+    }
+    const result = await storage.setUseAt(key, entries);
+    if (!result) throw new StorageError(404, "NOT_FOUND", `no object at ${key}`);
+    return reply.code(200).send({ ...objectJson(result.info), ...(result.pending ? { pending: true } : {}) });
+  });
+
   app.post("/api/v1/spool/flush", async () => storage.flushSpool());
 
   app.post("/api/v1/cache/prune", async () => {

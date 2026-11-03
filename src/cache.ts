@@ -145,6 +145,22 @@ export class DiskCache {
     await rm(spooled, { force: true });
   }
 
+  /** Rewrites the stored metadata of a cached object after its useAt (and etag) changed in the backend. */
+  async updateInfo(key: string, patch: { useAt?: string[] | undefined; etag?: string | undefined; lastModified?: string | undefined }): Promise<void> {
+    const entry = this.entries.get(key);
+    if (!entry) return;
+    const { useAt: _old, ...rest } = entry;
+    const updated: CacheEntry = {
+      ...rest,
+      ...(patch.etag ? { etag: patch.etag } : {}),
+      ...(patch.lastModified ? { lastModified: patch.lastModified } : {}),
+      ...(patch.useAt?.length ? { useAt: patch.useAt } : {})
+    };
+    this.entries.set(key, updated);
+    await writeJsonAtomic(join(this.objectsDir, `${stemOf(key)}.json`), updated);
+    this.dirty.delete(key);
+  }
+
   async remove(key: string): Promise<void> {
     const entry = this.entries.get(key);
     this.entries.delete(key);

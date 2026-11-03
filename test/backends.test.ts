@@ -2,7 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
-import { GetObjectCommand, HeadObjectCommand, ListObjectsV2Command, PutObjectCommand, type S3Client } from "@aws-sdk/client-s3";
+import { CopyObjectCommand, GetObjectCommand, HeadObjectCommand, ListObjectsV2Command, PutObjectCommand, type S3Client } from "@aws-sdk/client-s3";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { LocalBackend } from "../src/backends/local.js";
 import { EXPIRES_METADATA, S3Backend } from "../src/backends/s3.js";
@@ -178,5 +178,38 @@ describe("S3Backend (stub client, no network)", () => {
     const info = await backend.head("k");
     expect(sent[0]).toBeInstanceOf(HeadObjectCommand);
     expect(info).toMatchObject({ size: 4, contentType: "a/b", etag: "z", expiresAt: undefined });
+  });
+
+  it("changes useAt with a metadata-replacing copy onto itself and keeps type and retention", async () => {
+    let call = 0;
+    const { client, sent } = stubClient(() =>
+      call++ === 0
+        ? { ContentLength: 4, ContentType: "a/b", ETag: '"z"', Metadata: { "expires-at": "2027-01-01T00:00:00.000Z", "use-at": "2026-12-24" } }
+        : { CopyObjectResult: { ETag: '"y"' } }
+    );
+    const backend = new S3Backend(client, "bkt", "x");
+    const info = await backend.setUseAt("pi/dir/a b.txt", ["2026-11-08", "2026-11-09"]);
+    const copy = sent[1] as CopyObjectCommand;
+    expect(copy).toBeInstanceOf(CopyObjectCommand);
+    expect(copy.input).toMatchObject({
+      Bucket: "bkt",
+      Key: "pi/dir/a b.txt",
+      CopySource: "bkt/pi/dir/a%20b.txt",
+      MetadataDirective: "REPLACE",
+      ContentType: "a/b",
+      Metadata: { "expires-at": "2027-01-01T00:00:00.000Z", "use-at": "2026-11-08, 2026-11-09" }
+    });
+    expect(info).toMatchObject({ etag: "y", useAt: ["2026-11-08", "2026-11-09"], expiresAt: "2027-01-01T00:00:00.000Z" });
+
+    call = 0;
+    const cleared = stubClient(() => (call++ === 0 ? { ContentLength: 4, ContentType: "a/b", ETag: '"z"', Metadata: { "use-at": "2026-12-24" } } : {}));
+    const b2 = new S3Backend(cleared.client, "bkt", "x");
+    expect((await b2.setUseAt("k", []))?.useAt).toBeUndefined();
+    expect((cleared.sent[1] as CopyObjectCommand).input.Metadata).toEqual({});
+  });
+
+  it("answers null from setUseAt when the object is missing", async () => {
+    const backend = new S3Backend(stubClient(() => Promise.reject(awsError("NotFound", 404))).client, "bkt", "x");
+    expect(await backend.setUseAt("k", ["2026-11-08"])).toBeNull();
   });
 });

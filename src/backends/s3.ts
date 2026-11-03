@@ -14,6 +14,8 @@ import type { S3Settings } from "../config.js";
 
 /** User-metadata name that carries the retention deadline (sent as x-amz-meta-expires-at). */
 export const EXPIRES_METADATA = "expires-at";
+/** User-metadata name that carries the useAt entries, joined with ", " (x-amz-meta-use-at). */
+export const USE_AT_METADATA = "use-at";
 
 const PING_TIMEOUT_MS = 3000;
 
@@ -82,7 +84,13 @@ export class S3Backend implements StorageBackend {
         Body: body,
         ContentLength: request.size,
         ContentType: request.contentType,
-        Metadata: request.expiresAt ? { [EXPIRES_METADATA]: request.expiresAt } : undefined
+        Metadata:
+          request.expiresAt || request.useAt?.length
+            ? {
+                ...(request.expiresAt ? { [EXPIRES_METADATA]: request.expiresAt } : {}),
+                ...(request.useAt?.length ? { [USE_AT_METADATA]: request.useAt.join(", ") } : {})
+              }
+            : undefined
       })
     );
     return {
@@ -91,7 +99,8 @@ export class S3Backend implements StorageBackend {
       contentType: request.contentType,
       etag: (out?.ETag ?? "").replace(/"/g, ""),
       lastModified: new Date().toISOString(),
-      expiresAt: request.expiresAt
+      expiresAt: request.expiresAt,
+      ...(request.useAt?.length ? { useAt: request.useAt } : {})
     };
   }
 
@@ -203,7 +212,8 @@ export class S3Backend implements StorageBackend {
       contentType: out.ContentType ?? "application/octet-stream",
       etag: (out.ETag ?? "").replace(/"/g, ""),
       lastModified: out.LastModified?.toISOString() ?? new Date(0).toISOString(),
-      expiresAt: out.Metadata?.[EXPIRES_METADATA]
+      expiresAt: out.Metadata?.[EXPIRES_METADATA],
+      ...(out.Metadata?.[USE_AT_METADATA] ? { useAt: out.Metadata[USE_AT_METADATA]!.split(",").map((e) => e.trim()).filter(Boolean) } : {})
     };
   }
 

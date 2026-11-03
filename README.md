@@ -7,6 +7,7 @@ Durable file storage for the church's Pi ecosystem. Other Pi apps (piprogram fir
 - **Writes are never silently lost:** a write goes to the backend first. If the backend is down it is kept in a local spool on the Pi (answer 202, served from there) and uploaded when the backend is back; if the spool is off or full the write fails with 503.
 - **Key prefix:** every key is stored under `pi/` in the bucket (configurable), so the Pi ecosystem's files are recognisable in a shared bucket. Callers never see it.
 - **Signed links:** a link for one key and one method (GET or PUT) that works without the API key until it expires.
+- **Use date (`useAt`):** an object can say when it is meant to be used (a day, an hour, a moment, a range or several). pistorage fetches it into the Pi cache from 48 hours before and keeps it there until 6 hours after, so it is at hand if the internet is not.
 - **Retention:** an object can carry a deadline (for example Canva exports kept 60 days); a sweep deletes it.
 
 Status: first version. Nothing has been run against a real S3 service (VersityGW or Hetzner). The local-disk backend and the fake-offline tests are the only verified paths.
@@ -53,6 +54,11 @@ All variables use the `PISTORAGE_` prefix.
 | `PISTORAGE_CACHE_TTL_SECONDS` | `1209600` (14 days) | Cache lifetime from last access. |
 | `PISTORAGE_CACHE_MAX_BYTES` | `5368709120` (5 GiB) | Cache size cap; least recently used copies go first. |
 | `PISTORAGE_CACHE_SWEEP_SECONDS` | `600` | How often the cache is pruned and access times are saved. |
+| `PISTORAGE_TIMEZONE` | `Europe/Helsinki` | Zone for `useAt` dates that carry none. |
+| `PISTORAGE_PREFETCH` | `1` | Fetch objects whose `useAt` is near into the cache on a timer. |
+| `PISTORAGE_PREFETCH_SECONDS` | `900` | Interval of that sweep. |
+| `PISTORAGE_PREFETCH_LEAD_HOURS` | `48` | How long before its time an object is fetched. |
+| `PISTORAGE_PREFETCH_GRACE_HOURS` | `6` | How long after its time it stays pinned in the cache. |
 | `PISTORAGE_RETENTION_SWEEP` | `0` | `1` runs the retention sweep on a timer. Off by default. |
 | `PISTORAGE_RETENTION_SWEEP_SECONDS` | `3600` | Sweep interval when enabled. |
 
@@ -86,6 +92,7 @@ The client sends no streaming checksums (`requestChecksumCalculation: WHEN_REQUI
 | `POST /spool/flush` | Upload the writes waiting in the spool now. |
 | `GET /status` | Backend kind and reachability, cache bytes and count, stale responses served, last retention sweep. |
 | `POST /cache/prune` | Prune the cache now. |
+| `POST /prefetch/sweep` | Fetch objects whose `useAt` is near into the cache now. |
 | `POST /retention/sweep` | Run the retention sweep now. 409 unless `PISTORAGE_RETENTION_SWEEP=1`. |
 | `GET /health` | Liveness, no key needed. |
 
@@ -102,6 +109,7 @@ The full contract is `openapi/openapi.yaml`.
 - **Signed links:** the signature is an HMAC over method, key and expiry, so a link cannot be reused for another key or to write instead of read. Anyone holding a link can use it until it expires; there is no per-link revocation except changing the signing secret.
 - **Read:** a cached copy within its TTL is served without contacting the backend. A copy past its TTL is revalidated with the backend; if the backend is unreachable, the copy is served and marked stale.
 - **Eviction:** TTL-expired copies go only while the backend is reachable, so stale serving keeps working. The size cap always applies.
+- **useAt:** sent as the header `x-pistorage-use-at` on `PUT` (`2026-11-08`, `2026-11-08T10`, `2026-11-08T10:30`, `2026-11-08/2026-11-10`, several separated by commas), stored with the object (S3 metadata `use-at`) and returned on `GET`, `HEAD` and in the JSON. The format is in `src/use-at.ts` (no dependencies, meant to be shared with other files such as rundowns). The sweep lists the backend and asks about an object's `useAt` only when its etag is new. Pinned objects are exempt from age and size eviction; if they alone are over `PISTORAGE_CACHE_MAX_BYTES` the cache stays over the cap. It does not change the `useAt` of an existing object: upload again to change it.
 - **Retention:** past its deadline an object reads as missing. The sweep lists the backend and deletes expired objects from the backend and the cache. Each sweep makes one HEAD request per object, which is fine for a church's file count and costs time on a large bucket.
 - **Objects larger than the cache cap** are served but not kept on the Pi.
 - **Caveat:** a cached copy within its TTL is trusted without checking the backend, so a change made directly in the bucket (not through pistorage) is not seen until the TTL passes.
@@ -135,6 +143,8 @@ pistorage rm <key>
 pistorage ls [prefix] [--limit n]
 pistorage cache prune
 pistorage retention sweep
+pistorage prefetch
+pistorage put <key> <file> --use-at 2026-11-08/2026-11-09
 pistorage spool flush
 pistorage sign <key> [--method GET|PUT] [--expires-in seconds]
 ```

@@ -52,7 +52,8 @@ export class LocalBackend implements StorageBackend {
       contentType: request.contentType,
       etag: digest.digest("hex").slice(0, 32),
       lastModified: new Date().toISOString(),
-      expiresAt: request.expiresAt
+      expiresAt: request.expiresAt,
+      ...(request.useAt?.length ? { useAt: request.useAt } : {})
     };
     await this.writeMeta(stem, info);
     return info;

@@ -8,6 +8,8 @@ export interface ObjectInfo {
   etag: string;
   lastModified: string;
   expiresAt?: string | undefined;
+  /** When the object is meant to be used (see use-at.ts): entries such as 2026-11-08 or 2026-11-08/2026-11-10. */
+  useAt?: string[] | undefined;
 }
 
 export interface ListedObject {
@@ -32,6 +34,7 @@ export interface PutRequest {
   size: number;
   contentType: string;
   expiresAt?: string | undefined;
+  useAt?: string[] | undefined;
 }
 
 export interface GetResult {

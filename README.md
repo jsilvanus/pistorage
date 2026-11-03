@@ -4,7 +4,9 @@ Durable file storage for the church's Pi ecosystem. Other Pi apps (piprogram fir
 
 - **Backend:** S3 or any S3-compatible service (VersityGW on an operator PC now, Hetzner Object Storage later). Switching is configuration only.
 - **Cache:** on the Pi, with a TTL counted from last access, a size cap with least-recently-used eviction, and stale serving when the backend is unreachable.
-- **Writes are never silently lost:** a write goes to the backend first and fails with 503 while the backend is down.
+- **Writes are never silently lost:** a write goes to the backend first. If the backend is down it is kept in a local spool on the Pi (answer 202, served from there) and uploaded when the backend is back; if the spool is off or full the write fails with 503.
+- **Key prefix:** every key is stored under `pi/` in the bucket (configurable), so the Pi ecosystem's files are recognisable in a shared bucket. Callers never see it.
+- **Signed links:** a link for one key and one method (GET or PUT) that works without the API key until it expires.
 - **Retention:** an object can carry a deadline (for example Canva exports kept 60 days); a sweep deletes it.
 
 Status: first version. Nothing has been run against a real S3 service (VersityGW or Hetzner). The local-disk backend and the fake-offline tests are the only verified paths.
@@ -39,6 +41,13 @@ All variables use the `PISTORAGE_` prefix.
 | `PISTORAGE_S3_REGION` | `us-east-1` | Region string sent to the endpoint. |
 | `PISTORAGE_S3_ACCESS_KEY` / `PISTORAGE_S3_SECRET_KEY` | unset | Credentials. Set both or neither; with neither, the AWS default credential chain is used (`AWS_*` variables). |
 | `PISTORAGE_S3_FORCE_PATH_STYLE` | `1` | Path-style addressing (`endpoint/bucket/key`). Set `0` for virtual-hosted style. |
+| `PISTORAGE_KEY_PREFIX` | `pi/` | Prefix added to every key in the backend (S3 and local). `none` turns it off. Changing it later hides objects stored under the old prefix. |
+| `PISTORAGE_SPOOL` | `1` | `0` turns the write spool off (a write while the backend is down is then a 503). |
+| `PISTORAGE_SPOOL_DIR` | `./data/spool` | Where waiting writes are kept. They survive a restart. |
+| `PISTORAGE_SPOOL_MAX_BYTES` | `2147483648` (2 GiB) | Most data that may wait; beyond it a write is a 503. |
+| `PISTORAGE_SPOOL_FLUSH_SECONDS` | `30` | How often waiting writes are retried. |
+| `PISTORAGE_SIGNING_SECRET` | the API key | Secret for signed links. With neither this nor an API key, signed links are off (409 / 404). Changing it invalidates all links. |
+| `PISTORAGE_PUBLIC_URL` | unset | Public address of this service, so that signed links are returned as full URLs. |
 | `PISTORAGE_LOCAL_DIR` | `./data/store` | Local-disk backend, used when S3 is not configured. For development and tests. |
 | `PISTORAGE_CACHE_DIR` | `./data/cache` | Disk cache location. |
 | `PISTORAGE_CACHE_TTL_SECONDS` | `1209600` (14 days) | Cache lifetime from last access. |
@@ -72,6 +81,9 @@ The client sends no streaming checksums (`requestChecksumCalculation: WHEN_REQUI
 | `HEAD /objects/{key}` | Headers only: size, type, ETag, `Last-Modified`, `x-pistorage-expires-at`. |
 | `DELETE /objects/{key}` | Delete from the backend and cache. Idempotent (204). |
 | `GET /objects?prefix=&limit=` | List keys under a prefix (limit 1 to 1000, default 1000). |
+| `POST /signed-urls` | Body `{ key, method?: "GET"|"PUT", expiresInSeconds? }` (default GET, 3600 s, at most 7 days). Answers `{ method, path, url?, expiresAt }`. Needs the API key. |
+| `GET/HEAD/PUT /signed/{key}?expires=&sig=` | The link itself: no API key, valid only for that key and method (HEAD uses the GET link) until it expires. 403 `SIGNATURE_INVALID` or `LINK_EXPIRED` otherwise. |
+| `POST /spool/flush` | Upload the writes waiting in the spool now. |
 | `GET /status` | Backend kind and reachability, cache bytes and count, stale responses served, last retention sweep. |
 | `POST /cache/prune` | Prune the cache now. |
 | `POST /retention/sweep` | Run the retention sweep now. 409 unless `PISTORAGE_RETENTION_SWEEP=1`. |
@@ -79,13 +91,15 @@ The client sends no streaming checksums (`requestChecksumCalculation: WHEN_REQUI
 
 Keys: 1 to 512 characters; no leading `/`, no `..`, no backslash, no control characters, no empty or `.` path segments. In URLs each segment is percent-encoded and the `/` separators are kept.
 
-Responses carry `x-pistorage-stale: 1` when the backend could not be reached and a copy past its TTL was served. Errors are `{ "error": { "code", "message" } }`. A write while the backend is down is 503 `BACKEND_UNAVAILABLE`.
+Responses carry `x-pistorage-stale: 1` when the backend could not be reached and a copy past its TTL was served. Errors are `{ "error": { "code", "message" } }`. A write while the backend is down is kept in the spool: 202 with `x-pistorage-pending: 1` and `pending: true`, and reads of it carry the same header. Only with the spool off or full is it 503 `BACKEND_UNAVAILABLE`. `GET /status` shows how many writes wait and how old the oldest is.
 
 The full contract is `openapi/openapi.yaml`.
 
 ## Behaviour in brief
 
-- **Write:** the body is spooled to a temporary file (checked against `Content-Length`), sent to the backend, and only then moved into the cache. A failed backend write leaves nothing in the cache.
+- **Write:** the body is spooled to a temporary file (checked against `Content-Length`), sent to the backend, and only then moved into the cache. If the backend is down the file moves to the local spool instead (see above); nothing half-written reaches the cache.
+- **Spool caveat:** until a waiting write is uploaded, the Pi's disk holds the only copy. A newer write to the same key replaces the waiting one; a delete drops it; a listing includes waiting keys.
+- **Signed links:** the signature is an HMAC over method, key and expiry, so a link cannot be reused for another key or to write instead of read. Anyone holding a link can use it until it expires; there is no per-link revocation except changing the signing secret.
 - **Read:** a cached copy within its TTL is served without contacting the backend. A copy past its TTL is revalidated with the backend; if the backend is unreachable, the copy is served and marked stale.
 - **Eviction:** TTL-expired copies go only while the backend is reachable, so stale serving keeps working. The size cap always applies.
 - **Retention:** past its deadline an object reads as missing. The sweep lists the backend and deletes expired objects from the backend and the cache. Each sweep makes one HEAD request per object, which is fine for a church's file count and costs time on a large bucket.
@@ -103,6 +117,7 @@ const store = new PiStorageClient({ baseUrl: "http://127.0.0.1:3700", apiKey: pr
 await store.put("piprogram/hymns/1.pdf", bytes, { contentType: "application/pdf" });
 const response = await store.get("piprogram/hymns/1.pdf", { range: { start: 0, end: 1023 } });
 const info = await store.head("piprogram/hymns/1.pdf"); // null when absent
+const link = await store.signUrl("piprogram/hymns/1.pdf", { expiresInSeconds: 600 }); // link.url or base + link.path
 await store.delete("piprogram/hymns/1.pdf");
 const listing = await store.list("piprogram/");
 ```
@@ -120,6 +135,8 @@ pistorage rm <key>
 pistorage ls [prefix] [--limit n]
 pistorage cache prune
 pistorage retention sweep
+pistorage spool flush
+pistorage sign <key> [--method GET|PUT] [--expires-in seconds]
 ```
 
 Set `PISTORAGE_URL` (default `http://127.0.0.1:3700`) and `PISTORAGE_API_KEY`. The admin commands use the client generated from the OpenAPI file (`src/generated`, rebuilt by `pnpm run generate`).

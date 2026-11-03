@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { createReadStream } from "node:fs";
 import { Transform, type Readable } from "node:stream";
@@ -12,6 +13,12 @@ export interface StorageOptions {
   cache: DiskCache;
   maxUploadBytes: number;
   retentionSweepEnabled: boolean;
+  /**
+   * Where writes wait while the backend is down. They are served from here and uploaded when the
+   * backend answers again. Undefined = a write while the backend is down fails with 503.
+   */
+  spool?: DiskCache | undefined;
+  spoolMaxBytes?: number | undefined;
   now?: () => number;
 }
 
@@ -27,11 +34,20 @@ export interface OpenedObject {
   body: Readable;
   range?: ByteRange | undefined;
   stale: boolean;
+  pending?: boolean;
+}
+
+/** A stored object, and whether it is only in the local spool so far. */
+export interface PutResult {
+  info: ObjectInfo;
+  pending: boolean;
 }
 
 export interface HeadResult {
   info: ObjectInfo;
   stale: boolean;
+  /** True when the object is only in the local spool and not in the backend yet. */
+  pending?: boolean;
 }
 
 export interface RetentionSweepReport {
@@ -82,6 +98,9 @@ export class PiStorage {
   readonly cache: DiskCache;
   readonly maxUploadBytes: number;
   readonly retentionSweepEnabled: boolean;
+  readonly spool: DiskCache | undefined;
+  private readonly spoolMaxBytes: number;
+  private flushing = false;
   private readonly clock: () => number;
   private staleServed = 0;
   private lastRetentionSweep: RetentionSweepReport | null = null;
@@ -91,10 +110,12 @@ export class PiStorage {
     this.cache = options.cache;
     this.maxUploadBytes = options.maxUploadBytes;
     this.retentionSweepEnabled = options.retentionSweepEnabled;
+    this.spool = options.spool;
+    this.spoolMaxBytes = options.spoolMaxBytes ?? 2 * 1024 * 1024 * 1024;
     this.clock = options.now ?? Date.now;
   }
 
-  async put(key: string, input: PutInput): Promise<ObjectInfo> {
+  async put(key: string, input: PutInput): Promise<PutResult> {
     if (input.size > this.maxUploadBytes) {
       throw new StorageError(413, "TOO_LARGE", `object is larger than the ${this.maxUploadBytes} byte limit`);
     }
@@ -117,9 +138,12 @@ export class PiStorage {
         })
       );
     } catch (error) {
+      if (this.spool && isBackendUnavailable(error)) return this.keepInSpool(key, input, spooled, error);
       await this.cache.discard(spooled.path);
       throw error;
     }
+    // A newer version reached the backend: a waiting older one must not be uploaded later over it.
+    if (this.spool?.get(key)) await this.spool.remove(key);
 
     // Backend accepted it: now keep the copy, or drop an older cached copy that must not be served any more.
     try {
@@ -133,12 +157,90 @@ export class PiStorage {
       await this.cache.discard(spooled.path);
       await this.cache.remove(key);
     }
-    return stored;
+    return { info: stored, pending: false };
+  }
+
+  /** The backend is down: the write waits in the spool (within its size cap) and is uploaded later. */
+  private async keepInSpool(
+    key: string,
+    input: PutInput,
+    spooled: { path: string; bytes: number },
+    cause: BackendUnavailableError
+  ): Promise<PutResult> {
+    const spool = this.spool!;
+    const waiting = spool.get(key)?.size ?? 0;
+    if (spool.stats().bytes - waiting + spooled.bytes > this.spoolMaxBytes) {
+      await this.cache.discard(spooled.path);
+      throw new BackendUnavailableError(`${cause.message}; the local spool is full (${this.spoolMaxBytes} bytes)`);
+    }
+    const info: ObjectInfo = {
+      key,
+      size: spooled.bytes,
+      contentType: input.contentType,
+      etag: `pending-${randomUUID()}`,
+      lastModified: new Date(this.clock()).toISOString(),
+      ...(input.expiresAt ? { expiresAt: input.expiresAt } : {})
+    };
+    // Copy into the spool's own directory first: it may be on another disk than the read cache.
+    const copy = await spool.spool(createReadStream(spooled.path));
+    await this.cache.discard(spooled.path);
+    await spool.adopt(info, copy.path);
+    // An older copy in the read cache must not be served instead of this one.
+    await this.cache.remove(key);
+    return { info, pending: true };
+  }
+
+  /**
+   * Uploads the waiting writes, oldest first. Stops at the first sign that the backend is still down.
+   * Returns how many went through and how many are still waiting.
+   */
+  async flushSpool(): Promise<{ uploaded: number; waiting: number }> {
+    const spool = this.spool;
+    if (!spool || this.flushing) return { uploaded: 0, waiting: spool?.stats().count ?? 0 };
+    this.flushing = true;
+    let uploaded = 0;
+    try {
+      const entries = spool.allEntries().sort((a, b) => a.lastModified.localeCompare(b.lastModified));
+      for (const entry of entries) {
+        const path = spool.filePath(entry);
+        try {
+          const stored = await this.backend.put(entry.key, createReadStream(path), {
+            size: entry.size,
+            contentType: entry.contentType,
+            expiresAt: entry.expiresAt
+          });
+          // A newer write for this key may have replaced the entry while it uploaded.
+          if (spool.get(entry.key)?.etag !== entry.etag) continue;
+          uploaded += 1;
+          try {
+            if (entry.size <= this.cache.maxBytes) await this.cache.adopt(stored, path);
+          } catch {
+            // the read cache is only a convenience
+          }
+          await spool.remove(entry.key);
+        } catch (error) {
+          if (isBackendUnavailable(error)) break;
+          // Any other error is about this one object: leave it waiting and go on.
+        }
+      }
+    } finally {
+      this.flushing = false;
+    }
+    return { uploaded, waiting: spool.stats().count };
   }
 
   /** Opens an object for reading. Returns null when it does not exist (or its retention has passed). */
   async open(key: string, rangeHeader?: string): Promise<OpenedObject | null> {
     const now = this.clock();
+    const waiting = this.spool?.get(key);
+    if (waiting) {
+      if (isRetentionExpired(waiting.expiresAt, now)) {
+        await this.spool!.remove(key);
+      } else {
+        const opened = await this.serveCached(waiting, rangeHeader, false, this.spool!);
+        if (opened) return { ...opened, pending: true };
+      }
+    }
     const entry = this.cache.get(key);
     if (entry) {
       if (isRetentionExpired(entry.expiresAt, now)) {
@@ -167,6 +269,10 @@ export class PiStorage {
 
   async head(key: string): Promise<HeadResult | null> {
     const now = this.clock();
+    const waiting = this.spool?.get(key);
+    if (waiting && !isRetentionExpired(waiting.expiresAt, now)) {
+      return { info: infoOf(waiting), stale: false, pending: true };
+    }
     const entry = this.cache.get(key);
     if (entry && isRetentionExpired(entry.expiresAt, now)) {
       await this.cache.remove(key);
@@ -194,12 +300,21 @@ export class PiStorage {
   }
 
   async delete(key: string): Promise<void> {
+    await this.spool?.remove(key);
     await this.call(() => this.backend.delete(key));
     await this.cache.remove(key);
   }
 
   async list(prefix: string, limit?: number): Promise<ListResult> {
-    return this.call(() => this.backend.list(prefix, limit));
+    const listing = await this.call(() => this.backend.list(prefix, limit));
+    const waiting = (this.spool?.allEntries() ?? []).filter((e) => e.key.startsWith(prefix));
+    if (waiting.length === 0) return listing;
+    const merged = [
+      ...listing.items.filter((i) => !waiting.some((w) => w.key === i.key)),
+      ...waiting.map((e) => ({ key: e.key, size: e.size, etag: e.etag, lastModified: e.lastModified }))
+    ].sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+    const max = limit ?? 1000;
+    return { items: merged.slice(0, max), truncated: listing.truncated || merged.length > max };
   }
 
   /** Drops dead cache entries and enforces the size cap. TTL eviction waits while the backend is down. */
@@ -232,6 +347,7 @@ export class PiStorage {
   async status(): Promise<{
     backend: { kind: string; location: string; reachable: boolean };
     cache: { dir: string; bytes: number; count: number; maxBytes: number; ttlSeconds: number };
+    spool: { enabled: boolean; waiting: number; bytes: number; maxBytes: number; oldest: string | null };
     staleServed: number;
     lastRetentionSweep: RetentionSweepReport | null;
     retentionSweepEnabled: boolean;
@@ -247,6 +363,13 @@ export class PiStorage {
         count: stats.count,
         maxBytes: this.cache.maxBytes,
         ttlSeconds: Math.round(this.cache.ttlMs / 1000)
+      },
+      spool: {
+        enabled: this.spool !== undefined,
+        waiting: this.spool?.stats().count ?? 0,
+        bytes: this.spool?.stats().bytes ?? 0,
+        maxBytes: this.spoolMaxBytes,
+        oldest: (this.spool?.allEntries().map((e) => e.lastModified).sort()[0]) ?? null
       },
       staleServed: this.staleServed,
       lastRetentionSweep: this.lastRetentionSweep,
@@ -309,17 +432,22 @@ export class PiStorage {
   }
 
   /** Streams a cached copy. Returns undefined when the cached file has gone missing (the entry is dropped). */
-  private async serveCached(entry: CacheEntry, rangeHeader: string | undefined, stale: boolean): Promise<OpenedObject | undefined> {
+  private async serveCached(
+    entry: CacheEntry,
+    rangeHeader: string | undefined,
+    stale: boolean,
+    from: DiskCache = this.cache
+  ): Promise<OpenedObject | undefined> {
     const range = resolveRange(rangeHeader, entry.size);
-    const body = createReadStream(this.cache.filePath(entry), range ? { start: range.start, end: range.end } : undefined);
+    const body = createReadStream(from.filePath(entry), range ? { start: range.start, end: range.end } : undefined);
     try {
       await once(body, "open");
     } catch {
       body.destroy();
-      await this.cache.remove(entry.key);
+      await from.remove(entry.key);
       return undefined;
     }
-    this.cache.touch(entry.key);
+    from.touch(entry.key);
     return { info: infoOf(entry), body, range, stale };
   }
 

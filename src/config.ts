@@ -1,4 +1,5 @@
 import { join } from "node:path";
+import { normalizeKeyPrefix } from "./backends/prefixed.js";
 
 const MB = 1024 * 1024;
 const GB = 1024 * MB;
@@ -20,6 +21,14 @@ export interface PiStorageConfig {
   apiKey?: string | undefined;
   maxUploadBytes: number;
   backend: BackendSettings;
+  /** Prefix put on every key in the backend (default "pi/"); "" = none. */
+  keyPrefix: string;
+  /** Secret for signed URLs; undefined = signed URLs are off. Defaults to the API key. */
+  signingSecret?: string | undefined;
+  /** Public base URL of this service, used to return full signed URLs. */
+  publicUrl?: string | undefined;
+  /** Where writes wait while the backend is down; undefined = off (writes then fail with 503). */
+  spool?: { dir: string; maxBytes: number; flushSeconds: number } | undefined;
   cache: {
     dir: string;
     ttlSeconds: number;
@@ -101,6 +110,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, cwd: string = p
     apiKey,
     maxUploadBytes: intSetting(env, "PISTORAGE_MAX_BYTES", 500 * MB, 1, 64 * GB),
     backend,
+    keyPrefix: normalizeKeyPrefix(optional(env, "PISTORAGE_KEY_PREFIX") ?? "pi/"),
+    signingSecret: optional(env, "PISTORAGE_SIGNING_SECRET") ?? apiKey,
+    publicUrl: optional(env, "PISTORAGE_PUBLIC_URL")?.replace(/\/+$/, ""),
+    spool: boolSetting(env, "PISTORAGE_SPOOL", true)
+      ? {
+          dir: optional(env, "PISTORAGE_SPOOL_DIR") ?? join(cwd, "data", "spool"),
+          maxBytes: intSetting(env, "PISTORAGE_SPOOL_MAX_BYTES", 2 * GB, 1, 64 * 1024 * GB),
+          flushSeconds: intSetting(env, "PISTORAGE_SPOOL_FLUSH_SECONDS", 30, 1, 86400)
+        }
+      : undefined,
     cache: {
       dir: optional(env, "PISTORAGE_CACHE_DIR") ?? join(cwd, "data", "cache"),
       ttlSeconds: intSetting(env, "PISTORAGE_CACHE_TTL_SECONDS", 14 * 24 * 3600, 1, 10 * 365 * 24 * 3600),

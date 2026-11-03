@@ -13,6 +13,7 @@ export interface ObjectInfo {
   etag: string;
   lastModified: string;
   expiresAt?: string;
+  useAt?: string[];
 }
 
 export interface ListedObject {
@@ -31,6 +32,12 @@ export interface PutOptions {
   contentType?: string;
   /** Retention deadline; the object reads as missing after it and the retention sweep deletes it. */
   expiresAt?: Date | string;
+  /**
+   * When the object is meant to be used, so that pistorage can have it in the Pi cache beforehand:
+   * 2026-11-08 (a day), 2026-11-08T10 (an hour), 2026-11-08T10:30 (a moment) or 2026-11-08/2026-11-10
+   * (a range); a list or a comma separated string holds several.
+   */
+  useAt?: string | string[];
 }
 
 export interface GetOptions {
@@ -81,6 +88,9 @@ export class PiStorageClient {
     const headers: Record<string, string> = { "content-type": options.contentType ?? "application/octet-stream" };
     if (options.expiresAt !== undefined) {
       headers["x-pistorage-expires-at"] = typeof options.expiresAt === "string" ? options.expiresAt : options.expiresAt.toISOString();
+    }
+    if (options.useAt !== undefined) {
+      headers["x-pistorage-use-at"] = typeof options.useAt === "string" ? options.useAt : options.useAt.join(", ");
     }
     const response = await this.fetchFn(this.objectUrl(key), {
       method: "PUT",
@@ -166,6 +176,11 @@ export class PiStorageClient {
     return this.json("POST", "/cache/prune");
   }
 
+  /** Fetches objects whose useAt is near into the Pi cache now (it also runs on a timer). */
+  async prefetch(): Promise<unknown> {
+    return this.json("POST", "/prefetch/sweep");
+  }
+
   async sweepRetention(): Promise<unknown> {
     return this.json("POST", "/retention/sweep");
   }
@@ -223,5 +238,7 @@ function infoFromHeaders(key: string, headers: Headers): ObjectInfo {
   };
   const expiresAt = headers.get("x-pistorage-expires-at");
   if (expiresAt) info.expiresAt = expiresAt;
+  const useAt = headers.get("x-pistorage-use-at");
+  if (useAt) info.useAt = useAt.split(",").map((e) => e.trim()).filter(Boolean);
   return info;
 }

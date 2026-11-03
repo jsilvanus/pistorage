@@ -1,3 +1,4 @@
+import { assertTimezone, DEFAULT_TIMEZONE } from "./use-at.js";
 import { join } from "node:path";
 import { normalizeKeyPrefix } from "./backends/prefixed.js";
 
@@ -38,6 +39,15 @@ export interface PiStorageConfig {
   retention: {
     sweepEnabled: boolean;
     sweepSeconds: number;
+  };
+  /** Zone for dates in useAt that carry none. */
+  timezone: string;
+  /** Objects with a useAt are fetched into the cache ahead of time and kept there around that time. */
+  prefetch: {
+    enabled: boolean;
+    sweepSeconds: number;
+    leadHours: number;
+    graceHours: number;
   };
 }
 
@@ -129,6 +139,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, cwd: string = p
     retention: {
       sweepEnabled: boolSetting(env, "PISTORAGE_RETENTION_SWEEP", false),
       sweepSeconds: intSetting(env, "PISTORAGE_RETENTION_SWEEP_SECONDS", 3600, 60, 7 * 86400)
+    },
+    timezone: assertTimezone(optional(env, "PISTORAGE_TIMEZONE") ?? DEFAULT_TIMEZONE),
+    prefetch: {
+      enabled: boolSetting(env, "PISTORAGE_PREFETCH", true),
+      sweepSeconds: intSetting(env, "PISTORAGE_PREFETCH_SECONDS", 900, 10, 86400),
+      leadHours: intSetting(env, "PISTORAGE_PREFETCH_LEAD_HOURS", 48, 0, 24 * 90),
+      graceHours: intSetting(env, "PISTORAGE_PREFETCH_GRACE_HOURS", 6, 0, 24 * 30)
     }
   };
 }

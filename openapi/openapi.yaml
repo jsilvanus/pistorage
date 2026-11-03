@@ -151,6 +151,20 @@ paths:
           description: Kept in the local spool while the backend is down.
         "403":
           $ref: "#/components/responses/Error"
+  /api/v1/prefetch/sweep:
+    post:
+      operationId: sweepPrefetch
+      tags: [System]
+      summary: Fetch objects whose useAt is near into the cache now. Also runs on a timer (PISTORAGE_PREFETCH).
+      responses:
+        "200":
+          description: Sweep report.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PrefetchReport"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
   /api/v1/retention/sweep:
     post:
       operationId: sweepRetention
@@ -209,6 +223,16 @@ paths:
           schema:
             type: string
             format: date-time
+        - name: x-pistorage-use-at
+          in: header
+          required: false
+          description: >-
+            When the object is meant to be used, so that it can be fetched into the Pi cache beforehand.
+            Entries separated by commas: a day (2026-11-08), an hour (2026-11-08T10), a moment
+            (2026-11-08T10:30, optionally with a zone) or a range (2026-11-08/2026-11-10). Dates without a zone are
+            local time (PISTORAGE_TIMEZONE, default Europe/Helsinki). At most 32 entries; 400 INVALID_USE_AT otherwise.
+          schema:
+            type: string
       requestBody:
         required: true
         content:
@@ -358,6 +382,27 @@ components:
         expiresAt:
           type: string
           format: date-time
+        useAt:
+          type: array
+          items:
+            type: string
+          description: When the object is meant to be used (see x-pistorage-use-at).
+    PrefetchReport:
+      type: object
+      required: [at, checked, due, fetched, failed]
+      properties:
+        at:
+          type: string
+          format: date-time
+        checked:
+          type: integer
+        due:
+          type: integer
+          description: Objects whose time is near, so wanted in the cache.
+        fetched:
+          type: integer
+        failed:
+          type: integer
     ObjectList:
       type: object
       required: [items, truncated]

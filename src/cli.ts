@@ -19,13 +19,14 @@ export interface CliIo {
 const USAGE = `Usage: pistorage <command>
 
   pistorage status
-  pistorage put <key> <file> [--content-type <type>] [--expires-at <ISO 8601>]
+  pistorage put <key> <file> [--content-type <type>] [--expires-at <ISO 8601>] [--use-at <dates>]
   pistorage get <key> <file> [--range bytes=0-99]
   pistorage head <key>
   pistorage rm <key>
   pistorage ls [prefix] [--limit n]
   pistorage cache prune
   pistorage retention sweep
+  pistorage prefetch
   pistorage spool flush
   pistorage sign <key> [--method GET|PUT] [--expires-in seconds]
 
@@ -90,7 +91,8 @@ export async function runCli(args: string[], io: CliIo): Promise<number> {
         const body = await readFile(file);
         const info = await client.put(key, body, {
           contentType: flag(rest, "--content-type"),
-          expiresAt: flag(rest, "--expires-at")
+          expiresAt: flag(rest, "--expires-at"),
+          ...(flag(rest, "--use-at") === undefined ? {} : { useAt: flag(rest, "--use-at")! })
         });
         print(io, info);
         return 0;
@@ -128,6 +130,9 @@ export async function runCli(args: string[], io: CliIo): Promise<number> {
       case "retention":
         if (values[0] !== "sweep") throw new Error("expected: retention sweep");
         print(io, await SystemService.sweepRetention());
+        return 0;
+      case "prefetch":
+        print(io, await client.prefetch());
         return 0;
       case "spool":
         if (values[0] !== "flush") throw new Error("expected: spool flush");

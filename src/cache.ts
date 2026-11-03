@@ -50,6 +50,7 @@ export class DiskCache {
   private readonly objectsDir: string;
   private readonly tmpDir: string;
   private readonly clock: () => number;
+  private pinned: (entry: CacheEntry, now: number) => boolean = () => false;
 
   private constructor(private readonly options: DiskCacheOptions) {
     this.objectsDir = join(options.dir, "objects");
@@ -62,6 +63,18 @@ export class DiskCache {
     const cache = new DiskCache(options);
     await cache.load();
     return cache;
+  }
+
+  /**
+   * Entries for which this returns true are kept: not dropped for age and not evicted for size
+   * (a retention deadline still removes them). Used for objects that are about to be needed.
+   */
+  setPinned(predicate: (entry: CacheEntry, now: number) => boolean): void {
+    this.pinned = predicate;
+  }
+
+  isPinned(entry: CacheEntry, now: number = this.clock()): boolean {
+    return this.pinned(entry, now);
   }
 
   dirOf(): string {
@@ -151,7 +164,9 @@ export class DiskCache {
     let removed = 0;
     let freedBytes = 0;
     for (const entry of [...this.entries.values()]) {
-      const dead = isRetentionExpired(entry.expiresAt, now) || (options.dropTtlExpired && this.isTtlExpired(entry, now));
+      const dead =
+        isRetentionExpired(entry.expiresAt, now) ||
+        (options.dropTtlExpired && this.isTtlExpired(entry, now) && !this.pinned(entry, now));
       if (!dead) continue;
       freedBytes += entry.size;
       removed += 1;
@@ -159,7 +174,7 @@ export class DiskCache {
     }
     if (this.totalBytes > this.options.maxBytes) {
       const byAge = [...this.entries.values()]
-        .filter((entry) => entry.key !== options.exclude)
+        .filter((entry) => entry.key !== options.exclude && !this.pinned(entry, now))
         .sort((a, b) => a.lastAccess - b.lastAccess);
       for (const entry of byAge) {
         if (this.totalBytes <= this.options.maxBytes) break;

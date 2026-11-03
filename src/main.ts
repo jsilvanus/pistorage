@@ -27,7 +27,9 @@ async function main(): Promise<void> {
     spool,
     spoolMaxBytes: config.spool?.maxBytes,
     maxUploadBytes: config.maxUploadBytes,
-    retentionSweepEnabled: config.retention.sweepEnabled
+    retentionSweepEnabled: config.retention.sweepEnabled,
+    timezone: config.timezone,
+    prefetch: { leadMs: config.prefetch.leadHours * 3600_000, graceMs: config.prefetch.graceHours * 3600_000 }
   });
   const app = buildServer({
     storage,
@@ -62,6 +64,13 @@ async function main(): Promise<void> {
         storage.sweepRetention().catch((error: unknown) => log("retention sweep failed", error));
       }, config.retention.sweepSeconds * 1000)
     );
+  }
+  if (config.prefetch.enabled) {
+    const sweep = (): void => {
+      storage.prefetchDue().catch((error: unknown) => log("prefetch sweep failed", error));
+    };
+    timers.push(setInterval(sweep, config.prefetch.sweepSeconds * 1000));
+    setTimeout(sweep, 5000).unref();
   }
   for (const timer of timers) timer.unref();
 

@@ -7,6 +7,7 @@ import { DiskCache, type CacheEntry } from "./cache.js";
 import { BackendUnavailableError, isBackendUnavailable, StorageError } from "./errors.js";
 import { resolveRange } from "./range.js";
 import { isRetentionExpired } from "./retention.js";
+import { DEFAULT_TIMEZONE, isDue } from "./use-at.js";
 
 export interface StorageOptions {
   backend: StorageBackend;
@@ -19,6 +20,13 @@ export interface StorageOptions {
    */
   spool?: DiskCache | undefined;
   spoolMaxBytes?: number | undefined;
+  /** Zone for dates in useAt that carry none. Default Europe/Helsinki. */
+  timezone?: string | undefined;
+  /**
+   * Objects with a useAt are fetched into the cache and kept there from `leadMs` before their time
+   * until `graceMs` after it. Undefined = default 48 h before and 6 h after.
+   */
+  prefetch?: { leadMs: number; graceMs: number } | undefined;
   now?: () => number;
 }
 
@@ -26,6 +34,7 @@ export interface PutInput {
   size: number;
   contentType: string;
   expiresAt?: string | undefined;
+  useAt?: string[] | undefined;
   body: Readable;
 }
 
@@ -48,6 +57,18 @@ export interface HeadResult {
   stale: boolean;
   /** True when the object is only in the local spool and not in the backend yet. */
   pending?: boolean;
+}
+
+export interface PrefetchReport {
+  at: string;
+  /** Objects looked at (listed by the backend). */
+  checked: number;
+  /** Objects whose time is near and that are therefore wanted in the cache. */
+  due: number;
+  /** Fetched into the cache by this sweep. */
+  fetched: number;
+  /** Were due but could not be fetched (backend down, too large for the cache). */
+  failed: number;
 }
 
 export interface RetentionSweepReport {
@@ -104,6 +125,13 @@ export class PiStorage {
   private readonly clock: () => number;
   private staleServed = 0;
   private lastRetentionSweep: RetentionSweepReport | null = null;
+  private lastPrefetch: PrefetchReport | null = null;
+  private prefetching = false;
+  readonly timezone: string;
+  readonly prefetchLeadMs: number;
+  readonly prefetchGraceMs: number;
+  /** What the backend last told us about each key's useAt, by etag, so a sweep only asks about changed objects. */
+  private readonly useAtIndex = new Map<string, { etag: string; useAt: string[] }>();
 
   constructor(options: StorageOptions) {
     this.backend = options.backend;
@@ -113,6 +141,10 @@ export class PiStorage {
     this.spool = options.spool;
     this.spoolMaxBytes = options.spoolMaxBytes ?? 2 * 1024 * 1024 * 1024;
     this.clock = options.now ?? Date.now;
+    this.timezone = options.timezone ?? DEFAULT_TIMEZONE;
+    this.prefetchLeadMs = options.prefetch?.leadMs ?? 48 * 3600_000;
+    this.prefetchGraceMs = options.prefetch?.graceMs ?? 6 * 3600_000;
+    this.cache.setPinned((entry, now) => isDue(entry.useAt, this.timezone, now, this.prefetchLeadMs, this.prefetchGraceMs));
   }
 
   async put(key: string, input: PutInput): Promise<PutResult> {
@@ -134,7 +166,8 @@ export class PiStorage {
         this.backend.put(key, createReadStream(spooled.path), {
           size: input.size,
           contentType: input.contentType,
-          expiresAt: input.expiresAt
+          expiresAt: input.expiresAt,
+          useAt: input.useAt
         })
       );
     } catch (error) {
@@ -179,7 +212,8 @@ export class PiStorage {
       contentType: input.contentType,
       etag: `pending-${randomUUID()}`,
       lastModified: new Date(this.clock()).toISOString(),
-      ...(input.expiresAt ? { expiresAt: input.expiresAt } : {})
+      ...(input.expiresAt ? { expiresAt: input.expiresAt } : {}),
+      ...(input.useAt?.length ? { useAt: input.useAt } : {})
     };
     // Copy into the spool's own directory first: it may be on another disk than the read cache.
     const copy = await spool.spool(createReadStream(spooled.path));
@@ -207,7 +241,8 @@ export class PiStorage {
           const stored = await this.backend.put(entry.key, createReadStream(path), {
             size: entry.size,
             contentType: entry.contentType,
-            expiresAt: entry.expiresAt
+            expiresAt: entry.expiresAt,
+            useAt: entry.useAt
           });
           // A newer write for this key may have replaced the entry while it uploaded.
           if (spool.get(entry.key)?.etag !== entry.etag) continue;
@@ -344,6 +379,54 @@ export class PiStorage {
     return this.lastRetentionSweep;
   }
 
+  /**
+   * Fetches into the cache every object whose useAt is near (see `prefetch` in the options), so it is
+   * there when it is needed even if the backend or the internet is not. The cache keeps those objects
+   * until the grace period after their time has passed. Asks the backend about an object only when its
+   * etag in the listing is new, so a sweep over a large bucket is one listing.
+   */
+  async prefetchDue(): Promise<PrefetchReport> {
+    if (this.prefetching) return this.lastPrefetch ?? { at: new Date(this.clock()).toISOString(), checked: 0, due: 0, fetched: 0, failed: 0 };
+    this.prefetching = true;
+    const now = this.clock();
+    const report: PrefetchReport = { at: new Date(now).toISOString(), checked: 0, due: 0, fetched: 0, failed: 0 };
+    try {
+      const listing = await this.list("", 10000);
+      const seen = new Set<string>();
+      for (const item of listing.items) {
+        report.checked += 1;
+        seen.add(item.key);
+        let known = this.useAtIndex.get(item.key);
+        if (!known || known.etag !== item.etag) {
+          const info = await this.call(() => this.backend.head(item.key));
+          known = { etag: item.etag, useAt: info?.useAt ?? [] };
+          this.useAtIndex.set(item.key, known);
+        }
+        if (!isDue(known.useAt, this.timezone, now, this.prefetchLeadMs, this.prefetchGraceMs)) continue;
+        report.due += 1;
+        const cached = this.cache.get(item.key);
+        if (cached && cached.etag === item.etag) continue;
+        if (item.size > this.cache.maxBytes) {
+          report.failed += 1;
+          continue;
+        }
+        try {
+          const opened = await this.load(item.key, undefined);
+          opened?.body.destroy();
+          if (opened) report.fetched += 1;
+        } catch {
+          report.failed += 1;
+        }
+      }
+      for (const key of this.useAtIndex.keys()) if (!seen.has(key)) this.useAtIndex.delete(key);
+      await this.cache.prune({ dropTtlExpired: false, now });
+    } finally {
+      this.prefetching = false;
+    }
+    this.lastPrefetch = report;
+    return report;
+  }
+
   async status(): Promise<{
     backend: { kind: string; location: string; reachable: boolean };
     cache: { dir: string; bytes: number; count: number; maxBytes: number; ttlSeconds: number };
@@ -351,6 +434,7 @@ export class PiStorage {
     staleServed: number;
     lastRetentionSweep: RetentionSweepReport | null;
     retentionSweepEnabled: boolean;
+    prefetch: { timezone: string; leadHours: number; graceHours: number; pinned: number; last: PrefetchReport | null };
     maxUploadBytes: number;
   }> {
     const reachable = await this.backend.ping();
@@ -374,6 +458,13 @@ export class PiStorage {
       staleServed: this.staleServed,
       lastRetentionSweep: this.lastRetentionSweep,
       retentionSweepEnabled: this.retentionSweepEnabled,
+      prefetch: {
+        timezone: this.timezone,
+        leadHours: this.prefetchLeadMs / 3600_000,
+        graceHours: this.prefetchGraceMs / 3600_000,
+        pinned: this.cache.allEntries().filter((e) => this.cache.isPinned(e, this.clock())).length,
+        last: this.lastPrefetch
+      },
       maxUploadBytes: this.maxUploadBytes
     };
   }

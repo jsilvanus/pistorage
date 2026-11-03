@@ -13,6 +13,7 @@ import { RangeNotSatisfiableError, StorageError } from "./errors.js";
 import { assertKey, prefixProblem } from "./keys.js";
 import { contentRange, type ByteRange } from "./range.js";
 import type { OpenedObject, PiStorage } from "./storage.js";
+import { formatUseAt, parseUseAt, UseAtError } from "./use-at.js";
 import { checkSignature, MAX_SIGNED_SECONDS, signPath, type SignedMethod } from "./signing.js";
 
 export interface ServerOptions {
@@ -27,6 +28,7 @@ export interface ServerOptions {
 
 const DEFAULT_CONTENT_TYPE = "application/octet-stream";
 const EXPIRES_HEADER = "x-pistorage-expires-at";
+const USE_AT_HEADER = "x-pistorage-use-at";
 const STALE_HEADER = "x-pistorage-stale";
 const PENDING_HEADER = "x-pistorage-pending";
 
@@ -55,6 +57,18 @@ export function parseExpiresHeader(value: string | undefined, now: number = Date
   return new Date(time).toISOString();
 }
 
+/** Parses the x-pistorage-use-at header: dates, hours or ranges separated by commas (see use-at.ts). */
+export function parseUseAtHeader(value: string | undefined, timezone: string): string[] | undefined {
+  if (value === undefined || value.trim() === "") return undefined;
+  try {
+    const entries = parseUseAt(value, timezone);
+    return entries.length ? entries : undefined;
+  } catch (error) {
+    if (error instanceof UseAtError) throw new StorageError(400, "INVALID_USE_AT", `x-pistorage-use-at: ${error.message}`);
+    throw error;
+  }
+}
+
 function quoteEtag(etag: string): string {
   return `"${etag.replace(/"/g, "")}"`;
 }
@@ -71,6 +85,7 @@ function objectHeaders(reply: FastifyReply, info: ObjectInfo, stale: boolean, pe
   reply.header("last-modified", lastModifiedOf(info));
   reply.header("accept-ranges", "bytes");
   if (info.expiresAt) reply.header(EXPIRES_HEADER, info.expiresAt);
+  if (info.useAt?.length) reply.header(USE_AT_HEADER, formatUseAt(info.useAt));
   if (stale) reply.header(STALE_HEADER, "1");
 }
 
@@ -81,7 +96,8 @@ function objectJson(info: ObjectInfo) {
     contentType: info.contentType,
     etag: info.etag,
     lastModified: info.lastModified,
-    ...(info.expiresAt ? { expiresAt: info.expiresAt } : {})
+    ...(info.expiresAt ? { expiresAt: info.expiresAt } : {}),
+    ...(info.useAt?.length ? { useAt: info.useAt } : {})
   };
 }
 
@@ -182,6 +198,7 @@ export function buildServer(options: ServerOptions): FastifyInstance {
         size,
         contentType: request.headers["content-type"] || DEFAULT_CONTENT_TYPE,
         expiresAt: parseExpiresHeader(request.headers[EXPIRES_HEADER] as string | undefined),
+        useAt: parseUseAtHeader(request.headers[USE_AT_HEADER] as string | undefined, storage.timezone),
         body: request.raw as Readable
       });
       reply.header("etag", quoteEtag(result.info.etag));
@@ -262,6 +279,10 @@ export function buildServer(options: ServerOptions): FastifyInstance {
   app.post("/api/v1/cache/prune", async () => {
     const result = await storage.prune();
     return result;
+  });
+
+  app.post("/api/v1/prefetch/sweep", async (_request, reply) => {
+    return reply.code(200).send(await storage.prefetchDue());
   });
 
   app.post("/api/v1/retention/sweep", async (_request, reply) => {

@@ -1,0 +1,14 @@
+[Unit]
+Description=PiStorage Object Storage
+After=network-online.target
+
+[Service]
+WorkingDirectory=%h/apps/pistorage
+EnvironmentFile=%h/apps/pistorage.env
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.local/bin/node dist/main.js
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
